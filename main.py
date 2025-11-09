@@ -120,7 +120,8 @@ clear = col2.button("Clear chat")
 
 if clear:
     st.session_state.chat = []
-    st.experimental_rerun()
+    st.rerun()
+
 
 if send and nl_input.strip():
     bubble(nl_input, "user")
