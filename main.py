@@ -113,7 +113,8 @@ def fetch_tasks() -> Tuple[pd.DataFrame, str | None]:
             result = notion.databases.query(database_id=DATABASE_ID)
         else:
             # Fallback for older clients
-            result = notion.databases.query_database(DATABASE_ID)
+            result = notion.databases.query(database_id=DATABASE_ID)
+
 
         rows = result.get("results", [])
         tasks = []
