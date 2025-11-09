@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: pos-mvp-ui
+    env: python
+    plan: free
+    region: singapore
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "streamlit run main.py --server.port=$PORT --server.address=0.0.0.0"
+    envVars:
+      - key: NOTION_API_KEY
+        sync: false
+      - key: NOTION_DATABASE_ID
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: PARENT_AGENT_URL
+        sync: false
