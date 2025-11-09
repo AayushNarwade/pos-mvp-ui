@@ -1,233 +1,265 @@
-import streamlit as st
-from notion_client import Client
-from datetime import date, datetime
 import os
-from dotenv import load_dotenv
+import html
+from datetime import date, datetime
+from typing import Any, Dict, List, Tuple
+
 import pandas as pd
 import requests
-import google.generativeai as genai
-import html
-import re
-import time
+import streamlit as st
+from dotenv import load_dotenv
+from notion_client import Client
+
+# Optional (only used if GEMINI_API_KEY is set)
+try:
+    import google.generativeai as genai
+except Exception:  # pragma: no cover
+    genai = None
 
 # ================== ENV ==================
 load_dotenv()
-NOTION_API_KEY = os.getenv("NOTION_API_KEY")
-DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
-PARENT_AGENT_URL = os.getenv("PARENT_AGENT_URL", "http://localhost:8080/route")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+NOTION_API_KEY = os.getenv("NOTION_API_KEY", "").strip()
+DATABASE_ID = os.getenv("NOTION_DATABASE_ID", "").strip()
+PARENT_AGENT_URL = os.getenv("PARENT_AGENT_URL", "").strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
 # ================== INIT ==================
-notion = Client(auth=NOTION_API_KEY)
-
-use_research = bool(GEMINI_API_KEY)
-if use_research:
-    genai.configure(api_key=GEMINI_API_KEY)
-    research_model = genai.GenerativeModel("gemini-2.5-flash")
-
-
-# ================== UI SETUP ==================
 st.set_page_config(page_title="POS-MVP", page_icon="⚡", layout="wide")
 st.title("⚡ Present Operating System - MVP")
-st.markdown("Talk to your POS agent — tasks are auto-created in Notion, questions return research answers.")
+st.caption("Talk to your POS agent — tasks are auto-created in Notion; questions return concise research answers.")
 
+# ---------- Environment warnings ----------
+missing_env = []
+if not NOTION_API_KEY:
+    missing_env.append("NOTION_API_KEY")
+if not DATABASE_ID:
+    missing_env.append("NOTION_DATABASE_ID")
+if not PARENT_AGENT_URL:
+    missing_env.append("PARENT_AGENT_URL (backend /route endpoint)")
+if missing_env:
+    st.warning(
+        "Missing environment variables: **" + ", ".join(missing_env) +
+        "**. Set them in Render → **Environment** and redeploy."
+    )
 
-# ========== Custom CSS for premium bubbles ==========
-st.markdown("""
+# Notion client (only if keys exist)
+notion = Client(auth=NOTION_API_KEY) if NOTION_API_KEY else None
+
+# Gemini model (optional, only if key provided)
+use_research = bool(GEMINI_API_KEY and genai is not None)
+if use_research:
+    try:
+        genai.configure(api_key=GEMINI_API_KEY)
+        research_model = genai.GenerativeModel("gemini-1.5-flash-latest")
+    except Exception as e:
+        use_research = False
+        st.warning(f"Research disabled — Gemini init failed: {e}")
+
+# ================== STYLES ==================
+st.markdown(
+    """
 <style>
-.chat-container { max-width: 900px; margin: 0 auto; }
-.bubble { padding: 12px 14px; margin: 8px 0; border-radius: 14px; line-height: 1.45; font-size: 0.98rem; }
-.user { background: #1f6feb20; border: 1px solid #1f6feb55; color: #e6edf3; align-self: flex-end; }
-.ai   { background: #161b22; border: 1px solid #30363d; color: #c9d1d9; }
-.meta { font-size: 0.8rem; color: #8b949e; margin-top: -4px; margin-bottom: 6px;}
-.row { display: flex; flex-direction: column; }
-.loader { color: #8b949e; font-style: italic; padding: 6px 2px; }
+.bubble {padding: 12px 14px; margin: 8px 0; border-radius: 14px; line-height: 1.45; font-size: 0.98rem;}
+.user {background: #1f6feb20; border: 1px solid #1f6feb55; color: #e6edf3;}
+.ai {background: #161b22; border: 1px solid #30363d; color: #c9d1d9;}
+.small {font-size: 0.85rem; color: #8b949e;}
 </style>
-<div class="chat-container"></div>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
-
-# ================== Helpers ==================
-def render_bubble(text: str, who: str = "user"):
+def bubble(text: str, who: str = "user"):
+    """Render a chat bubble."""
     text = html.escape(text).replace("\n", "<br>")
     cls = "user" if who == "user" else "ai"
-    st.markdown(f"""<div class="row"><div class="bubble {cls}">{text}</div></div>""",
-                unsafe_allow_html=True)
+    st.markdown(f'<div class="bubble {cls}">{text}</div>', unsafe_allow_html=True)
 
+# ================== HELPERS ==================
 
-def detect_status(text: str) -> str:
-    """Smart status assignment based on time / completion language."""
-    lowered = text.lower()
-    # Finished / done case
-    if any(x in lowered for x in ["finished", "done", "completed", "sent already"]):
-        return "Done"
-    # Today case
-    today = datetime.now().strftime("%Y-%m-%d")
-    if "today" in lowered or today in lowered or "tonight" in lowered:
-        return "In Progress"
-    # Default
-    return "To Do"
+def _safe(props: Dict[str, Any], key: str, path: List[Any]) -> Any:
+    """Safely extract nested Notion properties."""
+    try:
+        val = props.get(key)
+        if not val:
+            return None
+        for p in path:
+            if isinstance(p, int):
+                if isinstance(val, list) and len(val) > p:
+                    val = val[p]
+                else:
+                    return None
+            else:
+                val = val.get(p) if isinstance(val, dict) else None
+            if val is None:
+                return None
+        return val
+    except Exception:
+        return None
 
+def _parse_iso(date_str: str) -> datetime | None:
+    try:
+        return datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+    except Exception:
+        return None
 
-def detect_avatar(text: str) -> str:
-    lowered = text.lower()
-    mapping = {
-        "Producer": ["create", "build", "write", "record", "design", "develop", "make"],
-        "Entrepreneur": ["pitch", "sell", "client", "sponsor", "investor", "market"],
-        "Administrator": ["email", "schedule", "organize", "submit", "send", "update"],
-        "Integrator": ["plan", "align", "sync", "review", "strategy", "roadmap"]
-    }
-    for avatar, words in mapping.items():
-        if any(w in lowered for w in words):
-            return avatar
-    return "Producer"  # fallback
-
-
-def extract_due_date(text: str) -> str | None:
-    """Very basic due date extraction (MVP). Supports 'today', 'tomorrow', or YYYY-MM-DD."""
-    lowered = text.lower()
-    if "today" in lowered:
-        return date.today().isoformat()
-    if "tomorrow" in lowered:
-        return (date.today()).replace(day=date.today().day + 1).isoformat()
-    m = re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", text)
-    return m.group(1) if m else None
-
-
-def add_task_to_notion(text: str):
-    """Use all auto-detected fields to create task."""
-    status = detect_status(text)
-    avatar = detect_avatar(text)
-    due = extract_due_date(text)
+@st.cache_data(ttl=30)
+def fetch_tasks() -> Tuple[pd.DataFrame, str | None]:
+    """Fetch tasks from Notion, support both Notion SDKs (v1 & v2)."""
+    if not notion:
+        return pd.DataFrame(), "Notion client is not configured."
 
     try:
-        props = {
-            "Name": {"title": [{"text": {"content": text}}]},
-            "Status": {"select": {"name": status}},
-            "Avatar": {"select": {"name": avatar}},
-            "XP": {"number": 0},
-        }
-        if due:
-            props["Due Date"] = {"date": {"start": due}}
+        # Prefer v2 style first
+        if hasattr(notion.databases, "query"):
+            result = notion.databases.query(database_id=DATABASE_ID)
+        else:
+            # Fallback for older clients
+            result = notion.databases.query_database(DATABASE_ID)
 
+        rows = result.get("results", [])
+        tasks = []
+        for p in rows:
+            props = p.get("properties", {})
+
+            name = _safe(props, "Name", ["title", 0, "plain_text"]) or "—"
+            status = _safe(props, "Status", ["select", "name"]) or "—"
+            avatar = _safe(props, "Avatar", ["select", "name"]) or "—"
+            xp = _safe(props, "XP", ["number"])
+            due = _safe(props, "Due Date", ["date", "start"])
+
+            tasks.append(
+                {
+                    "Task Name": name,
+                    "Status": status,
+                    "Avatar": avatar,
+                    "XP": int(xp) if isinstance(xp, (int, float)) else None,
+                    "Due Date": due,
+                }
+            )
+
+        df = pd.DataFrame(tasks)
+
+        # Sort by due date (soonest first); keep rows without a due date at bottom
+        if not df.empty and "Due Date" in df.columns:
+            df["_due_dt"] = df["Due Date"].apply(lambda s: _parse_iso(s) if isinstance(s, str) else None)
+            df = df.sort_values(by=["_due_dt"], ascending=[True], na_position="last").drop(columns=["_due_dt"])
+
+        return df, None
+
+    except Exception as e:
+        return pd.DataFrame(), str(e)
+
+def add_task_to_notion(task_text: str) -> Tuple[bool, str | None]:
+    """Create a simple task in Notion with sane defaults."""
+    if not notion:
+        return False, "Notion client is not configured."
+    try:
         notion.pages.create(
             parent={"database_id": DATABASE_ID},
-            properties=props,
+            properties={
+                "Name": {"title": [{"text": {"content": task_text}}]},
+                "Status": {"select": {"name": "To Do"}},
+                "Avatar": {"select": {"name": "Producer"}},
+                "XP": {"number": 0},
+            },
         )
         return True, None
     except Exception as e:
         return False, str(e)
 
-
 def research_answer(question: str) -> str:
-    """1–2 sentence factual response."""
-    prompt = (
-        "Answer the following question in 1–2 factual sentences, no bullet points, no markdown:\n\n"
-        f"Question: {question}"
-    )
+    """Call Gemini and return a concise 1–2 sentence answer."""
+    if not use_research:
+        return "Research is disabled (missing or invalid GEMINI_API_KEY)."
     try:
-        resp = research_model.generate_content(prompt, generation_config={"max_output_tokens": 256})
-        return (resp.text or "").strip()
+        prompt = (
+            "You are a concise research assistant. Answer the question in **one or two sentences**, "
+            "focusing on direct facts. No prefaces, no markdown headers.\n\n"
+            f"Question: {question}"
+        )
+        resp = research_model.generate_content(
+            prompt,
+            generation_config={"max_output_tokens": 384},
+        )
+        text = (resp.text or "").strip()
+        return text if text else "I couldn't find a reliable answer."
     except Exception as e:
         return f"(research error) {e}"
 
-
-# ================== Load Notion Tasks ==================
+# ================== TASK TABLE ==================
 st.subheader("📋 Current Notion Tasks")
 
-def safe_get(props, key, path):
-    try:
-        val = props.get(key)
-        if not val:
-            return "-"
-        for p in path:
-            if isinstance(p, int):
-                val = val[p] if isinstance(val, list) and len(val) > p else "-"
-            else:
-                val = val.get(p) if isinstance(val, dict) else "-"
-        return val if val else "-"
-    except Exception:
-        return "-"
+with st.spinner("Loading tasks from Notion…"):
+    df, err = fetch_tasks()
 
-try:
-    response = notion.databases.query(database_id=DATABASE_ID)
-    results = response.get("results", [])
-    if results:
-        tasks = []
-        for page in results:
-            props = page["properties"]
-            tasks.append({
-                "Task Name": safe_get(props, "Name", ["title", 0, "plain_text"]),
-                "Status": safe_get(props, "Status", ["select", "name"]),
-                "Avatar": safe_get(props, "Avatar", ["select", "name"]),
-                "XP": safe_get(props, "XP", ["number"]),
-                "Due Date": safe_get(props, "Due Date", ["date", "start"]),
-            })
-        st.dataframe(pd.DataFrame(tasks), use_container_width=True)
-    else:
-        st.info("No tasks found in your Notion database.")
-except Exception as e:
-    st.error(f"⚠️ Error fetching tasks: {e}")
+if err:
+    st.error(f"⚠️ Error fetching tasks: {err}")
+elif df.empty:
+    st.info("No tasks found in your Notion database.")
+else:
+    st.dataframe(df, use_container_width=True)
 
-
-# ================== PHASE 2 — Chat with POS ==================
+# ================== CHAT SECTION ==================
 st.subheader("💬 Talk to POS Agent")
 
 if "chat" not in st.session_state:
-    st.session_state.chat = []
+    st.session_state.chat = []  # [{"role": "user"/"assistant", "text": "..."}]
 
-nl_input = st.text_input("Type something like: `remind me to email Sarah at 5pm`")
-
-# Render chat history
+# Render history
 for msg in st.session_state.chat:
-    render_bubble(msg["text"], "user" if msg["role"] == "user" else "assistant")
+    bubble(msg["text"], "user" if msg["role"] == "user" else "ai")
 
-colA, colB = st.columns([1, 1])
-with colA:
-    send = st.button("Send to POS")
-with colB:
-    clear = st.button("Clear chat")
+nl_input = st.text_input("Ask a question or say a task like 'remind me to call Priya at 6pm'")
+
+c1, c2 = st.columns([1, 1])
+send = c1.button("Send to POS")
+clear = c2.button("Clear chat")
 
 if clear:
     st.session_state.chat = []
-    st.rerun()
+    st.experimental_rerun()
 
-if send:
-    if not nl_input.strip():
-        st.warning("Please type something.")
+if send and nl_input.strip():
+    # Show user message
+    st.session_state.chat.append({"role": "user", "text": nl_input})
+    bubble(nl_input, "user")
+
+    # Route via Parent Agent
+    try:
+        with st.spinner("Routing your message…"):
+            r = requests.post(PARENT_AGENT_URL, json={"message": nl_input}, timeout=25)
+            r.raise_for_status()
+            routed = r.json()
+    except Exception as e:
+        reply = f"❌ Could not reach Parent Agent at `{PARENT_AGENT_URL}`.\n\n{e}"
+        st.session_state.chat.append({"role": "assistant", "text": reply})
+        bubble(reply, "ai")
     else:
-        st.session_state.chat.append({"role": "user", "text": nl_input})
-        render_bubble(nl_input, "user")
+        intent = routed.get("intent", "UNKNOWN")
+        data = routed.get("data", nl_input)
 
-        # LOADING placeholder
-        with st.spinner("🧠 POS is thinking..."):
-            try:
-                r = requests.post(PARENT_AGENT_URL, json={"message": nl_input}, timeout=20)
-                routed = r.json()
-                intent = routed.get("intent", "UNKNOWN")
-                data = routed.get("data", nl_input)
+        if intent == "TASK":
+            with st.spinner("Creating task in Notion…"):
+                ok, err = add_task_to_notion(data)
+            if ok:
+                reply = f"✅ Task added to Notion: “{data}”."
+                # refresh cached table
+                fetch_tasks.clear()
+            else:
+                reply = f"❌ Failed to add task: {err}"
 
-                if intent == "TASK":
-                    ok, err = add_task_to_notion(data)
-                    reply = f"✅ Added task to Notion: “{data}”" if ok else f"❌ Failed to add task: {err}"
-                    st.session_state.chat.append({"role": "assistant", "text": reply})
-                    st.rerun()
+            st.session_state.chat.append({"role": "assistant", "text": reply})
+            bubble(reply, "ai")
 
-                elif intent == "RESEARCH":
-                    if not use_research:
-                        reply = "❌ Research mode disabled (missing GEMINI_API_KEY)."
-                    else:
-                        answer = research_answer(data)
-                        reply = answer or "I couldn't find a clear answer."
-                    st.session_state.chat.append({"role": "assistant", "text": reply})
-                    st.rerun()
+        elif intent == "RESEARCH":
+            with st.spinner("Researching…"):
+                reply = research_answer(data)
+            st.session_state.chat.append({"role": "assistant", "text": reply})
+            bubble(reply, "ai")
 
-                else:
-                    reply = "⚠️ I couldn't classify that. Try phrasing it as a task or a question."
-                    st.session_state.chat.append({"role": "assistant", "text": reply})
-                    st.rerun()
+        else:
+            reply = "I couldn't classify that. Try phrasing it as a task (e.g., “remind me to…”) or a question."
+            st.session_state.chat.append({"role": "assistant", "text": reply})
+            bubble(reply, "ai")
 
-            except Exception as e:
-                reply = f"❌ Could not reach Parent Agent ({PARENT_AGENT_URL}) — {e}"
-                st.session_state.chat.append({"role": "assistant", "text": reply})
-                st.rerun()
+st.markdown('<div class="small">Need to change keys/URLs? Update your Render '
+            'environment variables and redeploy.</div>', unsafe_allow_html=True)
