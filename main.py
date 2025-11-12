@@ -22,8 +22,16 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-st.title("🤖 Present Operating System (POS)")
-st.caption("All-in-one AI Task Management Dashboard — powered by Notion + Render Agents")
+# ---------------- Header ----------------
+col_header1, col_header2 = st.columns([8, 2])
+with col_header1:
+    st.title("🤖 Present Operating System (POS)")
+    st.caption("All-in-one AI Task Management Dashboard — powered by Notion + Render Agents")
+with col_header2:
+    st.markdown(
+        "<div style='text-align: right; font-size: 16px; font-weight: bold; color: #00FF7F;'>Made by Aayush Narwade</div>",
+        unsafe_allow_html=True,
+    )
 
 # ---------------- Session State ----------------
 if "messages" not in st.session_state:
@@ -161,23 +169,20 @@ with col2:
                 research_resp = response.get("research_resp", {})
                 research_data = research_resp.get("summary", {})
 
-                # Handle stringified JSON responses
                 if isinstance(research_data, str):
                     try:
                         research_data = json.loads(research_data)
-                        if isinstance(research_data, str):  # handle double-encoded JSON
+                        if isinstance(research_data, str):
                             research_data = json.loads(research_data)
                     except Exception:
                         research_data = {"raw_text": research_data}
 
-                # Extract fields robustly
                 exec_summary = research_data.get("executive_summary", [])
                 key_findings = research_data.get("key_findings", [])
                 sources = research_data.get("notable_sources", [])
                 next_steps = research_data.get("recommended_next_steps", [])
                 raw_text = research_data.get("raw_text", "")
 
-                # Normalize to lists
                 for field_name in ["exec_summary", "key_findings", "sources", "next_steps"]:
                     val = locals()[field_name]
                     if isinstance(val, str):
@@ -186,7 +191,6 @@ with col2:
                         except Exception:
                             locals()[field_name] = [val]
 
-                # Build formatted reply
                 if exec_summary or key_findings or sources or next_steps:
                     agent_reply = "📚 **Research Summary:**\n\n"
                     if exec_summary:
@@ -231,7 +235,16 @@ with col3:
     else:
         st.info("No XP data available yet.")
 
+# ---------------- Database Viewer ----------------
+st.markdown("---")
+st.subheader("📂 Notion Database Viewer")
+
+if not tasks_df.empty:
+    st.dataframe(tasks_df, use_container_width=True)
+else:
+    st.info("No data available to display.")
+
 # ---------------- Render Deployment Hook ----------------
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 8501))  # Render assigns this dynamically
+    port = int(os.getenv("PORT", 8501))
     st.write(f"✅ Streamlit running on Render port {port}")
