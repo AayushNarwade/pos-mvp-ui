@@ -1,19 +1,15 @@
 services:
   - type: web
-    name: pos-mvp-ui
+    name: pos-frontend
     env: python
     plan: free
     region: singapore
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "streamlit run main.py --server.port=$PORT --server.address=0.0.0.0"
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run main.py --server.port=$PORT --server.address=0.0.0.0
     envVars:
-      - key: PYTHON_VERSION
-        value: 3.11
-      - key: NOTION_API_KEY
-        sync: false
+      - key: PARENT_AGENT_URL
+        value: https://pos-parent-agent.onrender.com/route
       - key: NOTION_DATABASE_ID
         sync: false
-      - key: GEMINI_API_KEY
-        sync: false
-      - key: PARENT_AGENT_URL
+      - key: NOTION_API_KEY
         sync: false

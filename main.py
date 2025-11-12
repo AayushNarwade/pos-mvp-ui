@@ -1,135 +1,237 @@
-import os
-import html
+import streamlit as st
 import requests
 import pandas as pd
-import streamlit as st
+import os
+from datetime import datetime
+import plotly.express as px
 from dotenv import load_dotenv
-from notion_client import Client
-import google.generativeai as genai
+import json
 
-# ------------------ ENV ------------------
+# ---------------- Load Environment ----------------
 load_dotenv()
-NOTION_API_KEY = os.getenv("NOTION_API_KEY")
-DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
-PARENT_AGENT_URL = os.getenv("PARENT_AGENT_URL", "http://localhost:8080/route")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# ------------------ CLIENTS ------------------
-notion = Client(auth=NOTION_API_KEY)
+# Render-compatible environment variables
+PARENT_AGENT_URL = os.getenv("PARENT_AGENT_URL", "https://pos-parent-agent-v3.onrender.com/route")
+NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID", "")
+NOTION_API_KEY = os.getenv("NOTION_API_KEY", "")
 
-use_research = bool(GEMINI_API_KEY)
-if use_research:
-    genai.configure(api_key=GEMINI_API_KEY)
-    research_model = genai.GenerativeModel("gemini-2.0-flash")
+# ---------------- Page Config ----------------
+st.set_page_config(
+    page_title="Present Operating System (POS)",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-# ------------------ UI SETUP ------------------
-st.set_page_config(page_title="POS-MVP", page_icon="⚡", layout="wide")
-st.title("⚡ Present Operating System - MVP")
-st.markdown("Talk to your POS agent — tasks are auto-created in Notion; questions return concise research answers.")
+st.title("🤖 Present Operating System (POS)")
+st.caption("All-in-one AI Task Management Dashboard — powered by Notion + Render Agents")
 
-st.markdown("""
-<style>
-.bubble {padding:12px 14px;margin:8px 0;border-radius:14px;line-height:1.45;font-size:0.98rem;}
-.user {background:#1f6feb20;border:1px solid #1f6feb55;color:#e6edf3;}
-.ai   {background:#161b22;border:1px solid #30363d;color:#c9d1d9;}
-</style>
-""", unsafe_allow_html=True)
+# ---------------- Session State ----------------
+if "messages" not in st.session_state:
+    st.session_state.messages = []
 
-def bubble(text, who="user"):
-    text = html.escape(text).replace("\n", "<br>")
-    st.markdown(f'<div class="bubble {who}">{text}</div>', unsafe_allow_html=True)
-
-# ------------------ NOTION HELPERS ------------------
-def safe_get(props, key, path):
+# ---------------- Helper Functions ----------------
+def call_parent_agent(message):
+    """Send message to Parent Agent and return structured response."""
     try:
-        val = props.get(key)
-        if not val:
-            return "-"
-        for p in path:
-            if isinstance(p, int):
-                val = val[p] if isinstance(val, list) and len(val) > p else "-"
-            else:
-                val = val.get(p) if isinstance(val, dict) else "-"
-        return val if val else "-"
-    except Exception:
-        return "-"
+        resp = requests.post(PARENT_AGENT_URL, json={"message": message}, timeout=45)
+        return resp.json()
+    except Exception as e:
+        return {"error": str(e)}
 
-def fetch_tasks_df():
-    res = notion.databases.query(database_id=DATABASE_ID)
-    rows = res.get("results", [])
-    tasks = [{
-        "Task": safe_get(p["properties"], "Task", ["title", 0, "plain_text"]),
-        "Name": safe_get(p["properties"], "Name", ["rich_text", 0, "plain_text"]),
-        "Status": safe_get(p["properties"], "Status", ["select", "name"]),
-        "Avatar": safe_get(p["properties"], "Avatar", ["select", "name"]),
-        "XP": safe_get(p["properties"], "XP", ["number"]),
-        "Due Date": safe_get(p["properties"], "Due Date", ["date", "start"]),
-    } for p in rows]
+def fetch_notion_tasks():
+    """Fetch current tasks from Notion database."""
+    if not NOTION_DATABASE_ID or not NOTION_API_KEY:
+        return pd.DataFrame()
+
+    url = f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query"
+    headers = {
+        "Authorization": f"Bearer {NOTION_API_KEY}",
+        "Notion-Version": "2022-06-28",
+        "Content-Type": "application/json"
+    }
+    res = requests.post(url, headers=headers)
+    if res.status_code != 200:
+        return pd.DataFrame()
+
+    data = res.json()
+    tasks = []
+    for item in data.get("results", []):
+        props = item["properties"]
+        tasks.append({
+            "Task": props["Task"]["title"][0]["plain_text"] if props["Task"]["title"] else "",
+            "PAEI Role": props["PAEI Role"]["select"]["name"] if props["PAEI Role"]["select"] else "",
+            "XP": props["XP"]["number"],
+            "Status": props["Status"]["select"]["name"] if props["Status"]["select"] else "",
+            "Due Date": props["Due Date"]["date"]["start"] if props["Due Date"]["date"] else "",
+            "Calendar Link": props["Calendar Link"]["url"],
+            "Email Link": props["Email Link"]["url"]
+        })
     return pd.DataFrame(tasks)
 
-# ------------------ SECTION: TASKS TABLE ------------------
-st.subheader("📋 Current Notion Tasks")
-tasks_df = fetch_tasks_df()
-st.dataframe(tasks_df, use_container_width=True)
+def get_paei_stats(df):
+    """Calculate XP per PAEI Role."""
+    if df.empty:
+        return pd.DataFrame(columns=["PAEI Role", "XP"])
+    
+    stats = df.groupby("PAEI Role")["XP"].sum().reset_index()
+    all_roles = ["Producer", "Administrator", "Entrepreneur", "Integrator"]
+    stats = stats.set_index("PAEI Role").reindex(all_roles, fill_value=0).reset_index()
+    return stats
 
-# ------------------ SECTION: CHAT ------------------
-st.subheader("💬 Talk to POS Agent")
-if "chat" not in st.session_state:
-    st.session_state.chat = []
+# ---------------- Layout ----------------
+col1, col2, col3 = st.columns([2.5, 5, 3.5])
 
-nl_input = st.text_input("Ask a question or say a task like 'remind me to call Priya at 6pm'")
+# ---------------- Sidebar: To-Do Tasks ----------------
+with col1:
+    st.subheader("🧾 To-Do Tasks")
+    tasks_df = fetch_notion_tasks()
+    if not tasks_df.empty:
+        todo_df = tasks_df[tasks_df["Status"] == "To Do"]
+        for _, row in todo_df.iterrows():
+            st.markdown(f"**{row['Task']}**")
+            st.caption(f"🕒 {row['Due Date']} | 🎭 {row['PAEI Role']}")
+            st.divider()
+    else:
+        st.info("No active tasks found or Notion credentials missing.")
 
-def research_answer(q: str) -> str:
-    try:
-        ans = research_model.generate_content(
-            f"Answer in 1–2 concise sentences:\n\n{q}",
-            generation_config={"max_output_tokens": 256},
-        )
-        return (ans.text or "I couldn't find the answer.").strip()
-    except Exception as e:
-        return f"(research error) {e}"
+# ---------------- Chatbot Interface ----------------
+with col2:
+    st.subheader("💬 Chat with POS")
 
-# Render chat history
-for msg in st.session_state.chat:
-    bubble(msg["text"], "user" if msg["role"] == "user" else "ai")
+    for msg in st.session_state.messages:
+        role = "user" if msg["role"] == "user" else "assistant"
+        with st.chat_message(role):
+            st.markdown(msg["content"])
 
-col1, col2 = st.columns([1,1])
-send = col1.button("Send to POS")
-clear = col2.button("Clear chat")
+    user_input = st.chat_input("Type your message...")
+    if user_input:
+        st.session_state.messages.append({"role": "user", "content": user_input})
 
-if clear:
-    st.session_state.chat = []
-    st.rerun()
+        response = call_parent_agent(user_input)
+        agent_reply = ""
 
-if send and nl_input.strip():
-    st.session_state.chat.append({"role": "user", "text": nl_input})
-    bubble(nl_input, "user")
+        if "intent" in response:
+            intent = response["intent"]
 
-    try:
-        r = requests.post(PARENT_AGENT_URL, json={"message": nl_input}, timeout=20)
-        routed = r.json()
-        intent = routed.get("intent", "UNKNOWN")
+            if intent == "TASK":
+                agent_reply = "✅ Task allocated in Notion."
 
-        if intent == "TASK":
-            reply = f"✅ Task added to Notion: “{routed.get('task_name', '-')}" \
-                    f"” for {routed.get('person_name', '-')}" \
-                    f" — XP: {routed.get('xp', 0)}" \
-                    f" — Due: {routed.get('due_date', '-')}"
-            st.session_state.chat.append({"role": "assistant", "text": reply})
-            bubble(reply, "ai")
-            st.rerun()
+            elif intent == "CALENDAR":
+                cal_resp = response.get("cal_resp", {})
+                if isinstance(cal_resp, str):
+                    try:
+                        cal_resp = json.loads(cal_resp)
+                    except Exception:
+                        cal_resp = {"message": cal_resp}
+                link = cal_resp.get("calendar_link") or cal_resp.get("html_link") or ""
+                if link:
+                    agent_reply = f"📅 Task scheduled successfully. [View in Calendar]({link})"
+                else:
+                    msg = cal_resp.get("message", "Calendar event created successfully.")
+                    agent_reply = f"📅 {msg}"
 
-        elif intent == "RESEARCH":
-            reply = research_answer(routed.get("question", nl_input)) if use_research else "⚠️ Research disabled."
-            st.session_state.chat.append({"role": "assistant", "text": reply})
-            bubble(reply, "ai")
+            elif intent == "EMAIL":
+                email_resp = response.get("email_resp", {})
+                if isinstance(email_resp, str):
+                    try:
+                        email_resp = json.loads(email_resp)
+                    except Exception:
+                        email_resp = {"message": email_resp}
+                brevo_data = email_resp.get("brevo_response", {})
+                if isinstance(brevo_data, str):
+                    try:
+                        brevo_data = json.loads(brevo_data)
+                    except Exception:
+                        brevo_data = {"messageId": brevo_data}
+                link = brevo_data.get("messageId", "")
+                if link:
+                    agent_reply = f"📨 Email sent successfully. Message ID: `{link}`"
+                else:
+                    msg = email_resp.get("message", "Email sent successfully.")
+                    agent_reply = f"📨 {msg}"
 
+            elif intent == "COMPLETION":
+                xp_info = response.get("xp_resp", "")
+                if isinstance(xp_info, (dict, list)) or len(str(xp_info)) > 120:
+                    agent_reply = "🏆 Task completed. XP awarded!"
+                else:
+                    agent_reply = f"🏆 Task completed. XP awarded! {xp_info}"
+
+            elif intent == "RESEARCH":
+                research_resp = response.get("research_resp", {})
+                research_data = research_resp.get("summary", {})
+
+                # Handle stringified JSON responses
+                if isinstance(research_data, str):
+                    try:
+                        research_data = json.loads(research_data)
+                        if isinstance(research_data, str):  # handle double-encoded JSON
+                            research_data = json.loads(research_data)
+                    except Exception:
+                        research_data = {"raw_text": research_data}
+
+                # Extract fields robustly
+                exec_summary = research_data.get("executive_summary", [])
+                key_findings = research_data.get("key_findings", [])
+                sources = research_data.get("notable_sources", [])
+                next_steps = research_data.get("recommended_next_steps", [])
+                raw_text = research_data.get("raw_text", "")
+
+                # Normalize to lists
+                for field_name in ["exec_summary", "key_findings", "sources", "next_steps"]:
+                    val = locals()[field_name]
+                    if isinstance(val, str):
+                        try:
+                            locals()[field_name] = json.loads(val)
+                        except Exception:
+                            locals()[field_name] = [val]
+
+                # Build formatted reply
+                if exec_summary or key_findings or sources or next_steps:
+                    agent_reply = "📚 **Research Summary:**\n\n"
+                    if exec_summary:
+                        agent_reply += "**Executive Summary:**\n" + "\n".join([f"- {x}" for x in exec_summary]) + "\n\n"
+                    if key_findings:
+                        agent_reply += "**Key Findings:**\n" + "\n".join([f"- {x}" for x in key_findings]) + "\n\n"
+                    if sources:
+                        agent_reply += "**Sources:**\n" + "\n".join([f"- {x}" for x in sources]) + "\n\n"
+                    if next_steps:
+                        agent_reply += "**Recommended Next Steps:**\n" + "\n".join([f"- {x}" for x in next_steps])
+                elif raw_text:
+                    agent_reply = f"📖 **Research Summary:**\n\n{raw_text}"
+                else:
+                    agent_reply = "📖 Research completed successfully, but no detailed summary was found."
+
+            else:
+                agent_reply = "🤖 Processed successfully."
         else:
-            reply = "I couldn't classify that. Try a task or a question."
-            st.session_state.chat.append({"role": "assistant", "text": reply})
-            bubble(reply, "ai")
+            agent_reply = f"⚠️ Error: {response.get('error', 'Unknown issue')}"
 
-    except Exception as e:
-        reply = f"❌ Could not reach Parent Agent server.\n\n{e}"
-        st.session_state.chat.append({"role": "assistant", "text": reply})
-        bubble(reply, "ai")
+        st.session_state.messages.append({"role": "assistant", "content": agent_reply})
+        st.rerun()
+
+# ---------------- PAEI Analysis Board ----------------
+with col3:
+    st.subheader("📊 PAEI Analysis Board")
+
+    if not tasks_df.empty:
+        paei_df = get_paei_stats(tasks_df)
+        total_xp = paei_df["XP"].sum()
+        st.metric(label="🏆 Total XP Gained", value=f"{total_xp} XP")
+
+        fig = px.bar(
+            paei_df,
+            x="PAEI Role",
+            y="XP",
+            color="PAEI Role",
+            title="XP Distribution by Role",
+            text_auto=True,
+        )
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("No XP data available yet.")
+
+# ---------------- Render Deployment Hook ----------------
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", 8501))  # Render assigns this dynamically
+    st.write(f"✅ Streamlit running on Render port {port}")
